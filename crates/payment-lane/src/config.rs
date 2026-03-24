@@ -136,4 +136,33 @@ mod tests {
         ]);
         assert!(!prefix.matches(&non_payment));
     }
+
+    #[test]
+    fn test_zero_gas_fraction() {
+        let config = PaymentLaneConfig { payment_gas_fraction: 0.0, ..Default::default() };
+        assert_eq!(config.compute_general_gas_limit(30_000_000), 30_000_000);
+        assert_eq!(config.compute_payment_reserved_gas(30_000_000), 0);
+    }
+
+    #[test]
+    fn test_full_gas_fraction() {
+        let config = PaymentLaneConfig { payment_gas_fraction: 1.0, ..Default::default() };
+        assert_eq!(config.compute_general_gas_limit(30_000_000), 0);
+        assert_eq!(config.compute_payment_reserved_gas(30_000_000), 30_000_000);
+    }
+
+    #[test]
+    fn test_zero_block_gas_limit() {
+        let config = PaymentLaneConfig::default();
+        assert_eq!(config.compute_general_gas_limit(0), 0);
+        assert_eq!(config.compute_payment_reserved_gas(0), 0);
+    }
+
+    #[test]
+    fn test_empty_prefix() {
+        let prefix = PaymentPrefix::new(vec![]);
+        // An empty prefix matches every address.
+        let any_addr = Address::new([0xAB; 20]);
+        assert!(prefix.matches(&any_addr));
+    }
 }

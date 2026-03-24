@@ -5,11 +5,11 @@
 //!
 //! ## Classification Rules
 //!
-//! A transaction is classified as a payment when:
-//! 1. The `to` address starts with a known payment prefix (TIP-20 style), OR
-//! 2. The `to` address is in the payment allowlist, OR
-//! 3. The calldata matches known payment function selectors (`transfer`, `batchTransfer`) AND the
-//!    transaction has no contract creation.
+//! A transaction is classified as a payment only when:
+//! 1. The `to` address matches a known payment contract (prefix or allowlist), AND
+//! 2. The calldata matches a supported payment selector with the exact static ABI length.
+//!
+//! This intentionally favors a conservative false-negative bias over heuristic false positives.
 
 use crate::config::PaymentLaneConfig;
 use alloy_primitives::Address;
@@ -33,9 +33,11 @@ impl fmt::Display for TxLane {
     }
 }
 
-/// Well-known ERC-20 / TIP-20 function selectors for payment operations.
+/// Well-known payment function selectors.
+///
+/// The initial selector set is intentionally narrow until protocol-defined payment
+/// ABIs are introduced.
 const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb]; // transfer(address,uint256)
-const TRANSFER_FROM_SELECTOR: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd]; // transferFrom(address,address,uint256)
 
 /// Stateless payment transaction classifier.
 ///
@@ -61,36 +63,29 @@ impl PaymentClassifier {
             return TxLane::General;
         };
 
-        // Rule 1: Check payment address prefixes (TIP-20 style)
-        for prefix in &self.config.payment_address_prefixes {
-            if prefix.matches(to) {
-                return TxLane::Payment;
-            }
+        if !self.is_payment_target(to) {
+            return TxLane::General;
         }
 
-        // Rule 2: Check payment allowlist
-        if self.config.payment_allowlist.contains(to) {
+        if self.is_supported_payment_call(input) {
             return TxLane::Payment;
         }
 
-        // Rule 3: Check known payment selectors (only for simple transfers)
-        if input.len() >= 4 {
-            let selector: [u8; 4] = [input[0], input[1], input[2], input[3]];
-            if selector == TRANSFER_SELECTOR || selector == TRANSFER_FROM_SELECTOR {
-                // Only classify as payment if the calldata is exactly the expected length
-                // (no extra data that might indicate complex logic)
-                let expected_len = if selector == TRANSFER_SELECTOR {
-                    4 + 64 // selector + address(32) + uint256(32)
-                } else {
-                    4 + 96 // selector + address(32) + address(32) + uint256(32)
-                };
-                if input.len() == expected_len {
-                    return TxLane::Payment;
-                }
-            }
+        TxLane::General
+    }
+
+    fn is_payment_target(&self, to: &Address) -> bool {
+        self.config.payment_allowlist.contains(to) ||
+            self.config.payment_address_prefixes.iter().any(|prefix| prefix.matches(to))
+    }
+
+    fn is_supported_payment_call(&self, input: &[u8]) -> bool {
+        if input.len() < 4 {
+            return false;
         }
 
-        TxLane::General
+        let selector: [u8; 4] = [input[0], input[1], input[2], input[3]];
+        selector == TRANSFER_SELECTOR && input.len() == 4 + 64
     }
 
     /// Returns a reference to the underlying config.
@@ -110,6 +105,12 @@ mod tests {
     use super::*;
     use alloy_primitives::{address, bytes};
 
+    fn transfer_calldata() -> Vec<u8> {
+        let mut calldata = vec![0xa9, 0x05, 0x9c, 0xbb];
+        calldata.extend_from_slice(&[0u8; 64]);
+        calldata
+    }
+
     #[test]
     fn test_contract_creation_is_general() {
         let classifier = PaymentClassifier::default();
@@ -123,7 +124,7 @@ mod tests {
             0x20, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
         ]);
-        assert_eq!(classifier.classify(Some(&payment_addr), &[]), TxLane::Payment);
+        assert_eq!(classifier.classify(Some(&payment_addr), &transfer_calldata()), TxLane::Payment);
     }
 
     #[test]
@@ -131,56 +132,94 @@ mod tests {
         let allowed = address!("0x1111111111111111111111111111111111111111");
         let config = PaymentLaneConfig { payment_allowlist: vec![allowed], ..Default::default() };
         let classifier = PaymentClassifier::new(config);
-        assert_eq!(classifier.classify(Some(&allowed), &[]), TxLane::Payment);
+        assert_eq!(classifier.classify(Some(&allowed), &transfer_calldata()), TxLane::Payment);
     }
 
     #[test]
-    fn test_transfer_selector_classification() {
+    fn test_selector_without_payment_target_is_general() {
         let classifier = PaymentClassifier::default();
         let to = address!("0xdead000000000000000000000000000000000001");
-
-        // ERC-20 transfer(address, uint256) — 4 + 32 + 32 = 68 bytes
-        let mut calldata = vec![0xa9, 0x05, 0x9c, 0xbb]; // selector
-        calldata.extend_from_slice(&[0u8; 64]); // address + uint256
-        assert_eq!(classifier.classify(Some(&to), &calldata), TxLane::Payment);
+        assert_eq!(classifier.classify(Some(&to), &transfer_calldata()), TxLane::General);
     }
 
     #[test]
     fn test_transfer_with_extra_data_is_general() {
-        let classifier = PaymentClassifier::default();
-        let to = address!("0xdead000000000000000000000000000000000001");
+        let allowed = address!("0x1111111111111111111111111111111111111111");
+        let config = PaymentLaneConfig { payment_allowlist: vec![allowed], ..Default::default() };
+        let classifier = PaymentClassifier::new(config);
 
         // transfer selector but with extra data (could be a hook)
-        let mut calldata = vec![0xa9, 0x05, 0x9c, 0xbb];
-        calldata.extend_from_slice(&[0u8; 64]);
+        let mut calldata = transfer_calldata();
         calldata.push(0x01); // extra byte
-        assert_eq!(classifier.classify(Some(&to), &calldata), TxLane::General);
+        assert_eq!(classifier.classify(Some(&allowed), &calldata), TxLane::General);
+    }
+
+    #[test]
+    fn test_payment_target_without_supported_selector_is_general() {
+        let allowed = address!("0x1111111111111111111111111111111111111111");
+        let config = PaymentLaneConfig { payment_allowlist: vec![allowed], ..Default::default() };
+        let classifier = PaymentClassifier::new(config);
+        assert_eq!(classifier.classify(Some(&allowed), &[]), TxLane::General);
     }
 
     #[test]
     fn test_unknown_selector_is_general() {
-        let classifier = PaymentClassifier::default();
-        let to = address!("0xdead000000000000000000000000000000000001");
+        let allowed = address!("0x1111111111111111111111111111111111111111");
+        let config = PaymentLaneConfig { payment_allowlist: vec![allowed], ..Default::default() };
+        let classifier = PaymentClassifier::new(config);
         let calldata = bytes!("deadbeef");
-        assert_eq!(classifier.classify(Some(&to), &calldata), TxLane::General);
+        assert_eq!(classifier.classify(Some(&allowed), &calldata), TxLane::General);
     }
 
     #[test]
     fn test_simple_eth_transfer_is_general() {
-        // Plain ETH transfer (no calldata, no payment prefix) is general
+        // Plain ETH transfer (no calldata) stays in the general lane.
         let classifier = PaymentClassifier::default();
         let to = address!("0xdead000000000000000000000000000000000001");
         assert_eq!(classifier.classify(Some(&to), &[]), TxLane::General);
     }
 
     #[test]
-    fn test_transfer_from_selector_classification() {
-        let classifier = PaymentClassifier::default();
-        let to = address!("0xdead000000000000000000000000000000000001");
+    fn test_transfer_from_is_not_payment_by_default() {
+        let allowed = address!("0x1111111111111111111111111111111111111111");
+        let config = PaymentLaneConfig { payment_allowlist: vec![allowed], ..Default::default() };
+        let classifier = PaymentClassifier::new(config);
 
-        // transferFrom(address, address, uint256) — 4 + 32 + 32 + 32 = 100 bytes
-        let mut calldata = vec![0x23, 0xb8, 0x72, 0xdd]; // selector
-        calldata.extend_from_slice(&[0u8; 96]); // from + to + amount
-        assert_eq!(classifier.classify(Some(&to), &calldata), TxLane::Payment);
+        let mut calldata = vec![0x23, 0xb8, 0x72, 0xdd];
+        calldata.extend_from_slice(&[0u8; 96]);
+        assert_eq!(classifier.classify(Some(&allowed), &calldata), TxLane::General);
+    }
+
+    #[test]
+    fn test_short_calldata_with_payment_target_is_general() {
+        let allowed = address!("0x1111111111111111111111111111111111111111");
+        let config = PaymentLaneConfig { payment_allowlist: vec![allowed], ..Default::default() };
+        let classifier = PaymentClassifier::new(config);
+        // Only 3 bytes: too short for any selector.
+        assert_eq!(classifier.classify(Some(&allowed), &[0xa9, 0x05, 0x9c]), TxLane::General);
+    }
+
+    #[test]
+    fn test_multiple_prefixes() {
+        use crate::config::PaymentPrefix;
+        let config = PaymentLaneConfig {
+            payment_address_prefixes: vec![
+                PaymentPrefix::new(vec![0x20, 0xc0]),
+                PaymentPrefix::new(vec![0xAA, 0xBB]),
+            ],
+            ..Default::default()
+        };
+        let classifier = PaymentClassifier::new(config);
+        let addr = Address::new([
+            0xAA, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ]);
+        assert_eq!(classifier.classify(Some(&addr), &transfer_calldata()), TxLane::Payment);
+    }
+
+    #[test]
+    fn test_tx_lane_display() {
+        assert_eq!(TxLane::Payment.to_string(), "payment");
+        assert_eq!(TxLane::General.to_string(), "general");
     }
 }

@@ -115,6 +115,52 @@ impl<Pool, Client, EvmConfig> PaymentLanePayloadBuilder<Pool, Client, EvmConfig>
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LaneGasBudget {
+    total_gas_limit: u64,
+    general_gas_limit: u64,
+    cumulative_gas_used: u64,
+    general_gas_used: u64,
+}
+
+impl LaneGasBudget {
+    const fn new(total_gas_limit: u64, general_gas_limit: u64) -> Self {
+        Self { total_gas_limit, general_gas_limit, cumulative_gas_used: 0, general_gas_used: 0 }
+    }
+
+    const fn can_fit_in_block(&self, tx_gas_limit: u64) -> bool {
+        self.cumulative_gas_used.saturating_add(tx_gas_limit) <= self.total_gas_limit
+    }
+
+    const fn can_fit_in_lane(&self, lane: TxLane, tx_gas_limit: u64) -> bool {
+        match lane {
+            TxLane::Payment => true,
+            TxLane::General => {
+                self.general_gas_used.saturating_add(tx_gas_limit) <= self.general_gas_limit
+            }
+        }
+    }
+
+    fn record_execution(&mut self, lane: TxLane, gas_used: u64) {
+        self.cumulative_gas_used = self.cumulative_gas_used.saturating_add(gas_used);
+        if lane == TxLane::General {
+            self.general_gas_used = self.general_gas_used.saturating_add(gas_used);
+        }
+    }
+
+    const fn payment_reserved_gas(&self) -> u64 {
+        self.total_gas_limit.saturating_sub(self.general_gas_limit)
+    }
+
+    const fn payment_gas_used(&self) -> u64 {
+        self.cumulative_gas_used.saturating_sub(self.general_gas_used)
+    }
+
+    const fn payment_used_overflow_capacity(&self) -> bool {
+        self.payment_gas_used() > self.payment_reserved_gas()
+    }
+}
+
 impl<Pool, Client, EvmConfig> PayloadBuilder for PaymentLanePayloadBuilder<Pool, Client, EvmConfig>
 where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
@@ -248,9 +294,7 @@ where
     ));
 
     let mut total_fees = U256::ZERO;
-    let mut cumulative_gas_used = 0u64;
-    let mut general_gas_used = 0u64;
-    let mut payment_gas_used = 0u64;
+    let mut lane_budget = LaneGasBudget::new(block_gas_limit, general_gas_limit);
 
     builder.apply_pre_execution_changes().map_err(|err| {
         warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
@@ -275,7 +319,7 @@ where
 
     while let Some(pool_tx) = best_txs.next() {
         // Check total block gas capacity
-        if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
+        if !lane_budget.can_fit_in_block(pool_tx.gas_limit()) {
             best_txs.mark_invalid(
                 &pool_tx,
                 &InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
@@ -294,12 +338,12 @@ where
         // Enforce dual gas budget
         match lane {
             TxLane::General => {
-                if general_gas_used + pool_tx.gas_limit() > general_gas_limit {
+                if !lane_budget.can_fit_in_lane(lane, pool_tx.gas_limit()) {
                     // General budget exhausted — skip this general tx but don't mark sender
                     // as invalid (other txs from same sender might be payment txs)
                     metrics.general_tx_skipped_lane_full.increment(1);
                     trace!(target: "payload_builder",
-                        general_gas_used,
+                        general_gas_used = lane_budget.general_gas_used,
                         general_gas_limit,
                         tx_gas = pool_tx.gas_limit(),
                         "skipping general tx: lane budget exhausted"
@@ -419,16 +463,16 @@ where
         // Update dual-budget tracking
         match lane {
             TxLane::General => {
-                general_gas_used += gas_used;
+                lane_budget.record_execution(lane, gas_used);
                 metrics.general_tx_included.increment(1);
             }
             TxLane::Payment => {
-                payment_gas_used += gas_used;
+                lane_budget.record_execution(lane, gas_used);
                 metrics.payment_tx_included.increment(1);
-                if payment_gas_used <= (block_gas_limit - general_gas_limit) {
-                    metrics.payment_gas_used_reserved.increment(1);
-                } else {
+                if lane_budget.payment_used_overflow_capacity() {
                     metrics.payment_gas_used_overflow.increment(1);
+                } else {
+                    metrics.payment_gas_used_reserved.increment(1);
                 }
             }
         }
@@ -436,7 +480,6 @@ where
         let miner_fee =
             tx.effective_tip_per_gas(base_fee).expect("fee is always valid; execution succeeded");
         total_fees += U256::from(miner_fee) * U256::from(gas_used);
-        cumulative_gas_used += gas_used;
 
         if let Some(sidecar) = blob_tx_sidecar {
             blob_sidecars.push_sidecar_variant(sidecar.as_ref().clone());
@@ -444,9 +487,9 @@ where
     }
 
     debug!(target: "payload_builder",
-        cumulative_gas_used,
-        general_gas_used,
-        payment_gas_used,
+        cumulative_gas_used = lane_budget.cumulative_gas_used,
+        general_gas_used = lane_budget.general_gas_used,
+        payment_gas_used = lane_budget.payment_gas_used(),
         "payment lane payload build complete"
     );
 
@@ -482,4 +525,80 @@ where
         .with_sidecars(blob_sidecars);
 
     Ok(BuildOutcome::Better { payload, cached_reads })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lane_budget_blocks_general_before_total_limit() {
+        let lane_budget = LaneGasBudget::new(100, 70);
+
+        assert!(lane_budget.can_fit_in_block(40));
+        assert!(lane_budget.can_fit_in_lane(TxLane::General, 40));
+        assert!(!LaneGasBudget { general_gas_used: 60, ..lane_budget }
+            .can_fit_in_lane(TxLane::General, 20));
+    }
+
+    #[test]
+    fn test_lane_budget_allows_payment_after_general_lane_is_full() {
+        let lane_budget = LaneGasBudget {
+            total_gas_limit: 100,
+            general_gas_limit: 70,
+            cumulative_gas_used: 70,
+            general_gas_used: 70,
+        };
+
+        assert!(!lane_budget.can_fit_in_lane(TxLane::General, 1));
+        assert!(lane_budget.can_fit_in_lane(TxLane::Payment, 20));
+        assert!(lane_budget.can_fit_in_block(20));
+    }
+
+    #[test]
+    fn test_lane_budget_tracks_payment_overflow() {
+        let mut lane_budget = LaneGasBudget::new(100, 70);
+        lane_budget.record_execution(TxLane::Payment, 20);
+        assert!(!lane_budget.payment_used_overflow_capacity());
+
+        lane_budget.record_execution(TxLane::Payment, 20);
+        assert!(lane_budget.payment_used_overflow_capacity());
+        assert_eq!(lane_budget.payment_gas_used(), 40);
+    }
+
+    #[test]
+    fn test_lane_budget_new_initial_state() {
+        let budget = LaneGasBudget::new(100, 70);
+        assert_eq!(budget.cumulative_gas_used, 0);
+        assert_eq!(budget.general_gas_used, 0);
+        assert_eq!(budget.payment_reserved_gas(), 30);
+        assert_eq!(budget.payment_gas_used(), 0);
+        assert!(!budget.payment_used_overflow_capacity());
+    }
+
+    #[test]
+    fn test_builder_config_gas_limit() {
+        let cfg = PaymentLaneBuilderConfig { desired_gas_limit: 0, ..Default::default() };
+        assert_eq!(cfg.gas_limit(30_000_000), 30_000_000);
+
+        let cfg2 = PaymentLaneBuilderConfig { desired_gas_limit: 15_000_000, ..Default::default() };
+        assert_eq!(cfg2.gas_limit(30_000_000), 15_000_000);
+    }
+
+    #[test]
+    fn test_lane_budget_mixed_execution() {
+        let mut budget = LaneGasBudget::new(100, 70);
+        budget.record_execution(TxLane::General, 40);
+        budget.record_execution(TxLane::Payment, 20);
+        budget.record_execution(TxLane::General, 10);
+
+        assert_eq!(budget.general_gas_used, 50);
+        assert_eq!(budget.cumulative_gas_used, 70);
+        assert_eq!(budget.payment_gas_used(), 20);
+        assert!(budget.can_fit_in_lane(TxLane::General, 20));
+        assert!(!budget.can_fit_in_lane(TxLane::General, 21));
+        assert!(budget.can_fit_in_lane(TxLane::Payment, 30));
+        assert!(budget.can_fit_in_block(30));
+        assert!(!budget.can_fit_in_block(31));
+    }
 }

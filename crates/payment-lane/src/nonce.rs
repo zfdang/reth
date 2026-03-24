@@ -388,4 +388,57 @@ mod tests {
         assert!(w.is_valid_at(0));
         assert!(w.is_valid_at(u64::MAX));
     }
+
+    #[test]
+    fn test_nonce_key_helpers() {
+        let protocol = NonceKey::protocol(5);
+        assert!(protocol.is_protocol());
+        assert_eq!(protocol.key, 0);
+        assert_eq!(protocol.value, 5);
+
+        let next = protocol.next();
+        assert_eq!(next.key, 0);
+        assert_eq!(next.value, 6);
+
+        let user = NonceKey::user(3, 10);
+        assert!(!user.is_protocol());
+        assert_eq!(user.key, 3);
+        assert_eq!(user.value, 10);
+    }
+
+    #[test]
+    fn test_sender_nonce_state_active_keys() {
+        let mut state = SenderNonceState::new(0, 256);
+        assert_eq!(state.active_keys(), 1); // key 0 (protocol)
+
+        let tx = PaymentTxMeta::parallel(1, 0);
+        assert!(validate_payment_meta(&tx, &mut state, 100).is_ok());
+        assert_eq!(state.active_keys(), 2);
+    }
+
+    #[test]
+    fn test_get_nonce_nonexistent_key_returns_zero() {
+        let state = SenderNonceState::new(0, 256);
+        assert_eq!(state.get_nonce(999), 0);
+    }
+
+    #[test]
+    fn test_validity_window_boundary_conditions() {
+        // Exactly at valid_after boundary: should be valid.
+        let w = ValidityWindow::scheduled(100, 200);
+        assert!(w.is_valid_at(100));
+        // Exactly at valid_before boundary: should be invalid.
+        assert!(!w.is_valid_at(200));
+        // One before valid_before: valid.
+        assert!(w.is_valid_at(199));
+    }
+
+    #[test]
+    fn test_nonce_error_display() {
+        let err = NonceError::NonceTooLow { key: 0, expected: 5, got: 3 };
+        let msg = err.to_string();
+        assert!(msg.contains("too low"));
+        assert!(msg.contains("5"));
+        assert!(msg.contains("3"));
+    }
 }

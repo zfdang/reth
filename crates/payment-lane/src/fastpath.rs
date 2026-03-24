@@ -303,4 +303,85 @@ mod tests {
         let batches = detector.partition(&[]);
         assert!(batches.is_empty());
     }
+
+    #[test]
+    fn test_batch_payment_validity_edge_cases() {
+        let alice = address!("0x0000000000000000000000000000000000000001");
+        let bob = address!("0x0000000000000000000000000000000000000002");
+
+        // Empty batch is invalid.
+        let empty_batch = BatchPaymentIntent {
+            from: alice,
+            transfers: vec![],
+            asset: Address::ZERO,
+            nonce_key: 0,
+            nonce_value: 0,
+        };
+        assert!(!empty_batch.is_valid());
+
+        // Self-transfer is invalid.
+        let self_batch = BatchPaymentIntent {
+            from: alice,
+            transfers: vec![TransferTarget { to: alice, amount: U256::from(100) }],
+            asset: Address::ZERO,
+            nonce_key: 0,
+            nonce_value: 0,
+        };
+        assert!(!self_batch.is_valid());
+
+        // Zero amount is invalid.
+        let zero_batch = BatchPaymentIntent {
+            from: alice,
+            transfers: vec![TransferTarget { to: bob, amount: U256::ZERO }],
+            asset: Address::ZERO,
+            nonce_key: 0,
+            nonce_value: 0,
+        };
+        assert!(!zero_batch.is_valid());
+    }
+
+    #[test]
+    fn test_multi_asset_conflicts_are_independent() {
+        let mut detector = ConflictDetector::new();
+
+        let alice = address!("0x0000000000000000000000000000000000000001");
+        let bob = address!("0x0000000000000000000000000000000000000002");
+        let asset_a = address!("0x00000000000000000000000000000000000000aa");
+        let asset_b = address!("0x00000000000000000000000000000000000000bb");
+
+        // Same sender+receiver but different assets: no conflict.
+        let payments = vec![
+            PaymentIntent {
+                from: alice,
+                to: bob,
+                asset: asset_a,
+                amount: U256::from(100),
+                nonce_key: 0,
+                nonce_value: 0,
+            },
+            PaymentIntent {
+                from: alice,
+                to: bob,
+                asset: asset_b,
+                amount: U256::from(200),
+                nonce_key: 1,
+                nonce_value: 0,
+            },
+        ];
+
+        let batches = detector.partition(&payments);
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[test]
+    fn test_single_payment_single_batch() {
+        let mut detector = ConflictDetector::new();
+        let alice = address!("0x0000000000000000000000000000000000000001");
+        let bob = address!("0x0000000000000000000000000000000000000002");
+
+        let payments = vec![make_payment(alice, bob)];
+        let batches = detector.partition(&payments);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0], vec![0]);
+    }
 }

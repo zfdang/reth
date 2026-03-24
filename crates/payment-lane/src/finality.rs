@@ -34,7 +34,7 @@
 //! - Liveness: maintained as long as ≥2/3 of validators are honest and online
 
 use alloy_primitives::{B256, U256};
-use std::{fmt, time::Duration};
+use std::{collections::BTreeSet, fmt, time::Duration};
 
 /// Configuration for the BFT finality sidecar.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -134,8 +134,22 @@ pub struct FinalityCertificate {
 
 impl FinalityCertificate {
     /// Verifies this certificate has enough votes for the given BFT config.
-    pub const fn is_valid(&self, config: &BftConfig) -> bool {
-        self.votes.len() >= config.supermajority() as usize
+    pub fn is_valid(&self, config: &BftConfig) -> bool {
+        let mut voters = BTreeSet::new();
+
+        for vote in &self.votes {
+            if vote.block_hash != self.block_hash || vote.block_number != self.block_number {
+                return false;
+            }
+
+            if vote.validator_index >= config.validator_count ||
+                !voters.insert(vote.validator_index)
+            {
+                return false;
+            }
+        }
+
+        voters.len() >= config.supermajority() as usize
     }
 
     /// Returns the number of votes in this certificate.
@@ -206,11 +220,22 @@ impl FinalityTracker {
 
     /// Records a vote for a pending block. Returns the updated finality state.
     pub fn add_vote(&mut self, vote: Vote, config: &BftConfig) -> Option<BlockFinalityState> {
-        let block = self.pending_blocks.iter_mut().find(|b| b.hash == vote.block_hash)?;
+        let block = self
+            .pending_blocks
+            .iter_mut()
+            .find(|b| b.hash == vote.block_hash && b.number == vote.block_number)?;
 
         // Don't accept votes for already finalized blocks
         if block.state == BlockFinalityState::Finalized {
             return Some(BlockFinalityState::Finalized);
+        }
+
+        if vote.validator_index >= config.validator_count {
+            return Some(block.state);
+        }
+
+        if block.votes.iter().any(|existing| existing.validator_index == vote.validator_index) {
+            return Some(block.state);
         }
 
         block.votes.push(vote);
@@ -276,29 +301,15 @@ mod tests {
     #[test]
     fn test_finality_certificate_validation() {
         let config = BftConfig::default();
+        let block_hash = B256::from([1u8; 32]);
 
         let cert = FinalityCertificate {
-            block_hash: B256::from([1u8; 32]),
+            block_hash,
             block_number: 1,
             votes: vec![
-                Vote {
-                    validator_index: 0,
-                    block_hash: B256::from([1u8; 32]),
-                    block_number: 1,
-                    signature: vec![0],
-                },
-                Vote {
-                    validator_index: 1,
-                    block_hash: B256::from([1u8; 32]),
-                    block_number: 1,
-                    signature: vec![1],
-                },
-                Vote {
-                    validator_index: 2,
-                    block_hash: B256::from([1u8; 32]),
-                    block_number: 1,
-                    signature: vec![2],
-                },
+                Vote { validator_index: 0, block_hash, block_number: 1, signature: vec![0] },
+                Vote { validator_index: 1, block_hash, block_number: 1, signature: vec![1] },
+                Vote { validator_index: 2, block_hash, block_number: 1, signature: vec![2] },
             ],
             total_fees: U256::ZERO,
         };
@@ -309,6 +320,107 @@ mod tests {
         // Insufficient votes
         let bad_cert = FinalityCertificate { votes: vec![cert.votes[0].clone()], ..cert };
         assert!(!bad_cert.is_valid(&config));
+    }
+
+    #[test]
+    fn test_duplicate_votes_do_not_finalize_block() {
+        let config = BftConfig::default();
+        let mut tracker = FinalityTracker::new(0, B256::ZERO);
+
+        let block_hash = B256::from([2u8; 32]);
+        tracker.propose_block(block_hash, 1);
+
+        let vote = Vote { validator_index: 0, block_hash, block_number: 1, signature: vec![0] };
+        assert_eq!(
+            tracker.add_vote(vote.clone(), &config),
+            Some(BlockFinalityState::Voting { votes: 1 })
+        );
+        assert_eq!(tracker.add_vote(vote, &config), Some(BlockFinalityState::Voting { votes: 1 }));
+
+        let pending = tracker.pending_blocks.iter().find(|block| block.hash == block_hash).unwrap();
+        assert_eq!(pending.votes.len(), 1);
+        assert_ne!(pending.state, BlockFinalityState::Finalized);
+    }
+
+    #[test]
+    fn test_vote_with_wrong_block_number_is_ignored() {
+        let config = BftConfig::default();
+        let mut tracker = FinalityTracker::new(0, B256::ZERO);
+
+        let block_hash = B256::from([3u8; 32]);
+        tracker.propose_block(block_hash, 1);
+
+        let wrong_vote =
+            Vote { validator_index: 0, block_hash, block_number: 2, signature: vec![0] };
+        assert_eq!(tracker.add_vote(wrong_vote, &config), None);
+        assert!(tracker.pending_blocks[0].votes.is_empty());
+    }
+
+    #[test]
+    fn test_certificate_rejects_duplicate_voters() {
+        let config = BftConfig::default();
+        let block_hash = B256::from([4u8; 32]);
+
+        let cert = FinalityCertificate {
+            block_hash,
+            block_number: 7,
+            votes: vec![
+                Vote { validator_index: 0, block_hash, block_number: 7, signature: vec![0] },
+                Vote { validator_index: 0, block_hash, block_number: 7, signature: vec![1] },
+                Vote { validator_index: 1, block_hash, block_number: 7, signature: vec![2] },
+            ],
+            total_fees: U256::ZERO,
+        };
+
+        assert!(!cert.is_valid(&config));
+    }
+
+    #[test]
+    fn test_certificate_rejects_mismatched_vote_target() {
+        let config = BftConfig::default();
+        let block_hash = B256::from([5u8; 32]);
+
+        let cert = FinalityCertificate {
+            block_hash,
+            block_number: 7,
+            votes: vec![
+                Vote { validator_index: 0, block_hash, block_number: 7, signature: vec![0] },
+                Vote {
+                    validator_index: 1,
+                    block_hash: B256::from([6u8; 32]),
+                    block_number: 7,
+                    signature: vec![1],
+                },
+                Vote { validator_index: 2, block_hash, block_number: 7, signature: vec![2] },
+            ],
+            total_fees: U256::ZERO,
+        };
+
+        assert!(!cert.is_valid(&config));
+    }
+
+    #[test]
+    fn test_certificate_rejects_out_of_range_validator() {
+        let config = BftConfig::default();
+        let block_hash = B256::from([7u8; 32]);
+
+        let cert = FinalityCertificate {
+            block_hash,
+            block_number: 9,
+            votes: vec![
+                Vote { validator_index: 0, block_hash, block_number: 9, signature: vec![0] },
+                Vote { validator_index: 1, block_hash, block_number: 9, signature: vec![1] },
+                Vote {
+                    validator_index: config.validator_count,
+                    block_hash,
+                    block_number: 9,
+                    signature: vec![2],
+                },
+            ],
+            total_fees: U256::ZERO,
+        };
+
+        assert!(!cert.is_valid(&config));
     }
 
     #[test]
@@ -349,5 +461,79 @@ mod tests {
         assert_eq!(BlockFinalityState::Voting { votes: 2 }.to_string(), "voting (2 votes)");
         assert_eq!(BlockFinalityState::Finalized.to_string(), "finalized");
         assert_eq!(BlockFinalityState::Rejected.to_string(), "rejected");
+    }
+
+    #[test]
+    fn test_vote_on_already_finalized_block() {
+        let config = BftConfig::default();
+        let mut tracker = FinalityTracker::new(0, B256::ZERO);
+        let block_hash = B256::from([0xAA; 32]);
+        tracker.propose_block(block_hash, 1);
+
+        // Finalize the block.
+        for i in 0..3 {
+            let vote =
+                Vote { validator_index: i, block_hash, block_number: 1, signature: vec![i as u8] };
+            tracker.add_vote(vote, &config);
+        }
+
+        // Late vote on an already-finalized block should return Finalized without error.
+        let late = Vote { validator_index: 3, block_hash, block_number: 1, signature: vec![3] };
+        assert_eq!(tracker.add_vote(late, &config), Some(BlockFinalityState::Finalized));
+    }
+
+    #[test]
+    fn test_multiple_pending_blocks() {
+        let config = BftConfig::default();
+        let mut tracker = FinalityTracker::new(0, B256::ZERO);
+
+        let hash_a = B256::from([1u8; 32]);
+        let hash_b = B256::from([2u8; 32]);
+        tracker.propose_block(hash_a, 1);
+        tracker.propose_block(hash_b, 2);
+
+        // Vote on block 2 first.
+        for i in 0..3 {
+            let vote = Vote {
+                validator_index: i,
+                block_hash: hash_b,
+                block_number: 2,
+                signature: vec![i as u8],
+            };
+            tracker.add_vote(vote, &config);
+        }
+        assert_eq!(tracker.latest_finalized, 2);
+
+        // Block 1 is still pending, not affected.
+        let b1 = tracker.pending_blocks.iter().find(|b| b.number == 1).unwrap();
+        assert_eq!(b1.state, BlockFinalityState::Proposed);
+    }
+
+    #[test]
+    fn test_prune_noop_when_nothing_to_prune() {
+        let mut tracker = FinalityTracker::new(0, B256::ZERO);
+        tracker.propose_block(B256::from([1u8; 32]), 1);
+        tracker.prune(100);
+        // Nothing should be pruned since latest_finalized (0) <= keep (100).
+        assert_eq!(tracker.pending_blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_out_of_range_validator_vote_ignored() {
+        let config = BftConfig::default(); // 4 validators
+        let mut tracker = FinalityTracker::new(0, B256::ZERO);
+        let block_hash = B256::from([0xBB; 32]);
+        tracker.propose_block(block_hash, 1);
+
+        let bad_vote = Vote {
+            validator_index: config.validator_count, // out of range
+            block_hash,
+            block_number: 1,
+            signature: vec![0xFF],
+        };
+        let state = tracker.add_vote(bad_vote, &config);
+        // State should remain Proposed (vote rejected).
+        assert_eq!(state, Some(BlockFinalityState::Proposed));
+        assert!(tracker.pending_blocks[0].votes.is_empty());
     }
 }

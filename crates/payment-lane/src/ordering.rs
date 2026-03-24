@@ -2,7 +2,7 @@
 //!
 //! Implements [`TransactionOrdering`] that boosts payment transaction priority.
 //! Payment transactions get a configurable priority multiplier, ensuring they
-//! are selected first during payload building.
+//! receive a meaningful bid boost during payload building.
 
 use crate::classifier::{PaymentClassifier, TxLane};
 use reth_transaction_pool::{PoolTransaction, Priority, TransactionOrdering};
@@ -10,8 +10,8 @@ use std::{fmt, marker::PhantomData};
 
 /// Priority value that encodes both the lane classification and the base priority.
 ///
-/// Payment transactions are always ordered above general transactions at the same
-/// effective tip level due to the lane-based comparison.
+/// Payment transactions are ordered by their boosted effective tip, with the
+/// payment lane only acting as a tie-breaker at the same effective tip level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentPriority {
     /// Whether this is a payment transaction (boosted).
@@ -34,12 +34,14 @@ impl PartialOrd for PaymentPriority {
 
 impl Ord for PaymentPriority {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Payment txs always come before general txs
-        match (&self.lane, &other.lane) {
-            (TxLane::Payment, TxLane::General) => std::cmp::Ordering::Greater,
-            (TxLane::General, TxLane::Payment) => std::cmp::Ordering::Less,
-            _ => self.tip.cmp(&other.tip),
-        }
+        self.tip.cmp(&other.tip).then_with(|| lane_rank(self.lane).cmp(&lane_rank(other.lane)))
+    }
+}
+
+const fn lane_rank(lane: TxLane) -> u8 {
+    match lane {
+        TxLane::General => 0,
+        TxLane::Payment => 1,
     }
 }
 
@@ -120,11 +122,19 @@ mod tests {
 
     #[test]
     fn test_payment_priority_ordering() {
-        let payment = PaymentPriority { lane: TxLane::Payment, tip: 1 };
+        let payment = PaymentPriority { lane: TxLane::Payment, tip: 100 };
         let general = PaymentPriority { lane: TxLane::General, tip: 100 };
 
-        // Payment always beats general regardless of tip
+        // Payment wins ties at the same effective tip.
         assert!(payment > general);
+    }
+
+    #[test]
+    fn test_tip_dominates_cross_lane_ordering() {
+        let payment = PaymentPriority { lane: TxLane::Payment, tip: 10 };
+        let general = PaymentPriority { lane: TxLane::General, tip: 100 };
+
+        assert!(general > payment);
     }
 
     #[test]
@@ -143,5 +153,29 @@ mod tests {
         let ordering: PaymentAwareOrdering<reth_transaction_pool::EthPooledTransaction> =
             PaymentAwareOrdering::default();
         assert_eq!(ordering.boost_factor, 10);
+    }
+
+    #[test]
+    fn test_payment_priority_default() {
+        let p = PaymentPriority::default();
+        assert_eq!(p.lane, TxLane::General);
+        assert_eq!(p.tip, 0);
+    }
+
+    #[test]
+    fn test_zero_tip_ordering() {
+        let a = PaymentPriority { lane: TxLane::Payment, tip: 0 };
+        let b = PaymentPriority { lane: TxLane::General, tip: 0 };
+        assert!(a > b);
+    }
+
+    #[test]
+    fn test_ordering_clone_and_debug() {
+        let ordering: PaymentAwareOrdering<reth_transaction_pool::EthPooledTransaction> =
+            PaymentAwareOrdering::default();
+        let cloned = ordering.clone();
+        assert_eq!(cloned.boost_factor, ordering.boost_factor);
+        let debug = format!("{:?}", ordering);
+        assert!(debug.contains("PaymentAwareOrdering"));
     }
 }
