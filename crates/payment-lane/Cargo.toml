@@ -1,0 +1,71 @@
+[package]
+name = "reth-payment-lane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Payment lane support for reth: transaction classification, dual-budget payload building, consensus-enforced lanes, parallel nonces, and fast-path execution."
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-transaction-pool.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-primitives-traits.workspace = true
+reth-basic-payload-builder.workspace = true
+reth-payload-builder.workspace = true
+reth-payload-builder-primitives.workspace = true
+reth-payload-primitives.workspace = true
+reth-consensus.workspace = true
+reth-consensus-common.workspace = true
+reth-evm.workspace = true
+reth-evm-ethereum.workspace = true
+reth-errors.workspace = true
+reth-chainspec.workspace = true
+reth-storage-api.workspace = true
+reth-revm.workspace = true
+reth-execution-types.workspace = true
+
+# ethereum / alloy
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-rlp.workspace = true
+revm.workspace = true
+
+# metrics
+reth-metrics.workspace = true
+metrics.workspace = true
+
+# misc
+tracing.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+reth-transaction-pool = { workspace = true, features = ["test-utils"] }
+
+[features]
+default = ["std"]
+std = [
+    "reth-chainspec/std",
+    "reth-primitives-traits/std",
+    "reth-consensus/std",
+    "reth-consensus-common/std",
+    "reth-ethereum-primitives/std",
+    "reth-evm/std",
+    "reth-evm-ethereum/std",
+    "reth-execution-types/std",
+    "reth-revm/std",
+    "reth-storage-api/std",
+    "alloy-primitives/std",
+    "alloy-consensus/std",
+    "alloy-rlp/std",
+    "revm/std",
+    "serde/std",
+    "thiserror/std",
+    "tracing/std",
+]

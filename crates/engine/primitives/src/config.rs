@@ -62,6 +62,7 @@ const fn default_cross_block_cache_size() -> usize {
 /// - Sparse Trie task in payload processor
 /// - Multiproof computation spawned in payload processor
 /// - Storage root computation spawned in trie parallel proof
+#[allow(clippy::missing_const_for_fn)]
 pub fn has_enough_parallelism() -> bool {
     #[cfg(feature = "std")]
     {

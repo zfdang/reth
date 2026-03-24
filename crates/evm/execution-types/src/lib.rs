@@ -10,6 +10,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
+use alloy_rlp as _;
 
 mod chain;
 pub use chain::*;
