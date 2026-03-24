@@ -1,0 +1,534 @@
+# Payment Throughput / Finality Improvement Proposal
+
+## 1. 背景
+
+当前仓库是 `reth`，它已经把 txpool、payload builder、execution engine、RPC/Engine API、node components 都拆成了可替换组件。这意味着我们不需要推倒现有执行引擎，就能在这个 repo 上做一条 payment-first 的演进路线。
+
+参考资料：
+
+- Sui fast path: <https://move-book.com/object/fast-path-and-consensus/>
+- Tempo repo: <https://github.com/tempoxyz/tempo>
+- Tempo analysis: <https://github.com/zfdang/tempo-analysis/blob/main/docs/tempo-network-execution-layer.md>
+- Tempo blockspace overview: <https://docs.tempo.xyz/protocol/blockspace/overview>
+- Tempo payment lane specification: <https://docs.tempo.xyz/protocol/blockspace/payment-lane-specification>
+- Tempo consensus/finality: <https://docs.tempo.xyz/protocol/blockspace/consensus>
+
+结合你给的两类参考，我认为可以抽出两个核心结论：
+
+1. `Sui fast path` 的本质不是“更快的共识”，而是“当交易只触达独占对象或不可变对象时，不必走全局排序”。
+2. `Tempo` 的本质不是“单纯把 gas limit 调大”，而是把 payment workload 当成一等公民：
+   - 用 payment lane 保证 blockspace
+   - 用 deterministic BFT finality 缩短结算时间
+   - 用新的交易/nonce/fee 语义解决 payment workload 的热点问题
+
+对当前 repo 来说，最值得借鉴的不是直接照搬 Sui，而是：
+
+- 先做 `Tempo-style payment lane`
+- 再做 `payment-specific transaction semantics`
+- 最后再做 `受限 fast path + deterministic finality`
+
+## 2. 当前 repo 的现实约束
+
+### 2.1 当前 txpool / payload builder 没有 payment 概念
+
+目前 `reth` 的默认行为基本是：
+
+- txpool 以 fee priority 为主排序，见 `crates/transaction-pool/src/ordering.rs`
+- pending/queued/basefee/blob 四类 subpool 中没有 payment-aware 分类，见 `crates/transaction-pool/src/pool/txpool.rs`
+- 默认 payload builder 只认识一个总 gas budget，没有 payment/general lane 的独立预算，见 `crates/ethereum/payload/src/lib.rs`
+
+这意味着在高拥堵时，payment tx 会和普通合约调用、MEV、复杂 DeFi 交易争抢同一个 block budget。
+
+### 2.2 当前 finality 语义来自外部 forkchoice，不是本 repo 内生 BFT
+
+当前 `reth` 的链推进模型本质上还是：
+
+- 外部共识层/engine source 提供 `newPayload` + `forkchoiceUpdated`
+- EL 侧负责执行、验证、追踪 safe/finalized block
+
+相关落点：
+
+- forkchoice / finalized tracking: `crates/engine/primitives/src/forkchoice.rs`
+- engine orchestration: `crates/engine/tree/src/engine.rs`
+- engine launch path: `crates/node/builder/src/launch/engine.rs`
+
+所以：
+
+- 只改 txpool / payload builder，不能得到真正的 deterministic finality
+- 真正要改善 finality，必须引入新的 consensus layer，或者把 BFT 共识内嵌进当前 node launch 路径
+
+### 2.3 不能直接把“任意 ERC-20 transfer”当成 Sui fast path
+
+Sui fast path 成立的前提是对象所有权模型天然提供了冲突边界。
+
+但在 EVM 里，普通 ERC-20 transfer 默认仍然会触达共享合约状态：
+
+- sender balance slot
+- receiver balance slot
+- allowance slot
+- total supply / hook / fee logic
+- 甚至外部 call / custom logic
+
+所以对当前 repo 来说，不应尝试让“任意合约 payment”直接绕过排序。真正可行的 fast path 必须只针对：
+
+- 语义非常收敛的 payment tx type
+- 或 protocol-enforced 的 payment precompile / system contract
+- 或者能够静态确定读写集的受限交易
+
+## 3. 设计目标
+
+我建议把目标拆成四个独立 bottleneck：
+
+1. `blockspace contention`
+   payment 不应被一般计算 workload 挤出
+2. `hot account serialization`
+   高频付款账户不应被单 nonce 串行化拖死
+3. `settlement latency`
+   payment 应尽量在 1 个 block 内给出强确定性，而不是等多次确认
+4. `execution-path overhead`
+   对极简单的 payment，不应强制走完整通用 EVM block path
+
+## 4. 总体方案
+
+我建议采用分阶段、两条路径并行的方案：
+
+- 主路径：`payment lane -> consensus-enforced lane -> BFT finality`
+- 增强路径：`payment transaction semantics -> constrained fast path`
+
+其中最重要的设计判断是：
+
+- **payment lane 应该优先做**
+- **fast path 只能做成受限 payment path，不能做 generic EVM fast path**
+
+## 5. 方案细节
+
+### 5.1 Phase 1: 先做 soft payment lane
+
+这是最适合当前 repo 的第一步，因为侵入性最小，而且可以立刻提升 payment throughput。
+
+#### 核心思想
+
+在不立刻修改 block/header 共识格式的前提下，先把 builder policy 做成 payment-aware：
+
+- txpool 给交易打上 `PaymentClass`
+- payload builder 在打包时保留 payment quota
+- 普通交易只能使用 `general budget`
+- payment 交易可以继续吃掉保留给 payment 的剩余 budget
+
+这一步本质上是“builder policy”，不是“consensus rule”。
+
+#### 为什么先做它
+
+- 代码落点清晰，能直接复用 `reth` 的可插拔 pool / payload 组件
+- 不需要先重写 Engine API / header 类型
+- 可以先验证 payment classifier、lane 容量配置、拥堵下的收益
+
+#### 建议实现
+
+1. 在 txpool validation 阶段增加 payment classifier
+
+建议落点：
+
+- `crates/transaction-pool/src/validate/eth.rs`
+- `crates/ethereum/node/src/node.rs`
+
+建议规则：
+
+- 必须是 `stateless classification`
+- 只能依赖 transaction payload，不读链上状态
+- 初期建议只支持非常保守的规则：
+  - `to` 在 payment allowlist / prefix 内
+  - `calldata` selector 属于 `transfer` / `batchTransfer` / `pay`
+  - 禁止外部 call / delegatecall / create
+
+不要一开始就用“猜测型 calldata heuristic”，否则多客户端一致性会很差。
+
+2. 在 txpool 中保存 payment metadata，并支持 lane-aware ordering
+
+建议落点：
+
+- `crates/transaction-pool/src/ordering.rs`
+- `crates/transaction-pool/src/pool/mod.rs`
+- `crates/transaction-pool/src/pool/txpool.rs`
+
+建议新增：
+
+- `enum TxLane { Payment, General }`
+- `PaymentAwareOrdering`
+- payment/general 各自的 backlog、discard、promotion metrics
+
+这里不一定要在第一版就拆成两个独立 subpool；也可以先在 pending iterator 上做 `filter_transactions` + dual iterator。
+
+3. 用自定义 payload builder 实现 dual-budget packing
+
+建议落点：
+
+- `crates/ethereum/payload/src/lib.rs`
+- 或仿照 `examples/custom-payload-builder/src/main.rs` 做新的 builder
+- 注入点在 `crates/ethereum/node/src/payload.rs`
+
+建议打包策略：
+
+1. 先放 system tx（如果有）
+2. 给 general tx 一个上限 `general_gas_limit_soft`
+3. 在未达到总 block gas limit 前，优先继续打包 payment tx
+4. 当 payment backlog 很低时，可把保留预算回收给 general tx
+
+这样做的结果是：
+
+- 拥堵时 payment inclusion latency 更稳定
+- 空闲时不会浪费太多 blockspace
+
+#### 这一阶段的局限
+
+- 它只是 proposer-local policy
+- 其他 proposer 不遵守时，没有协议层保证
+- finality 没变，只是吞吐和 inclusion 改善
+
+### 5.2 Phase 2: 把 payment lane 从 builder policy 升级成 consensus rule
+
+这一阶段对应 Tempo 最值得借鉴的部分：`lane budget 必须可验证`。
+
+#### 核心思想
+
+为 block/header 增加 payment-aware gas accounting 字段，并在 block validity 中强制校验。
+
+可参考 Tempo 的字段设计：
+
+- `general_gas_limit`
+- `shared_gas_limit`
+- 可选 `timestamp_millis_part`
+
+对当前 repo，我建议第一版只引入：
+
+- `general_gas_limit`
+- 可选 `payment_gas_reserved` 或直接复用 `gas_limit - general_gas_limit`
+
+不建议第一版就把 Tempo 的 sub-block / shared lane 全量搬过来，因为当前 repo 还没有对应的 block production / validator subblock 结构。
+
+#### 建议实现
+
+1. 自定义 engine / payload types
+
+建议路径：
+
+- 参考 `examples/custom-engine-types/src/main.rs`
+- 修改或扩展 `crates/ethereum/engine-primitives/*`
+- 对应修改 `crates/ethereum/node/src/engine.rs`
+
+2. 扩展 header / block primitives
+
+需要支持：
+
+- header 新字段编码/解码
+- sealed block hash 计算
+- payload <-> block conversion
+
+3. 在 consensus validator 中加入 lane validity
+
+建议落点：
+
+- `crates/consensus/consensus/src/lib.rs`
+- `crates/ethereum/consensus/*`
+- `crates/ethereum/node/src/node.rs` 中的 `ConsensusBuilder`
+
+需要新增规则：
+
+- block `gas_used <= gas_limit`
+- `general lane` 内非 payment tx 的累计 gas `<= general_gas_limit`
+- payment classifier 必须 deterministic
+
+#### 为什么这一步很重要
+
+因为只有把 lane 做成共识规则，payment throughput 才是真正的协议保证，而不是“某个 proposer 的善意调度”。
+
+### 5.3 Phase 3: 引入 payment-specific transaction semantics，解决 hot sender 问题
+
+只做 payment lane 还不够。
+
+对 payment workload 来说，另一个大瓶颈是：`同一付款账户的 sequential nonce 串行化`。
+
+当前 txpool 明确假设了单 sender 的连续 nonce 才能进入 pending path，这对“单商户账号批量打款”非常不友好。
+
+#### 建议方向
+
+引入新的 payment tx type，至少解决以下两个问题：
+
+- `parallel nonces`
+- `bounded validity window`
+
+可以借鉴 Tempo 的：
+
+- 2D nonce / nonce key
+- expiring nonce
+
+#### 为什么这对当前 repo 很关键
+
+因为如果没有并行 nonce：
+
+- 一个高频支付账户仍然会在 txpool 里形成串行队列
+- payment lane 只能解决“和别人争抢 blockspace”，不能解决“自己把自己堵住”
+
+#### 建议实现
+
+第一版不一定要上完整新交易类型，也可以先做：
+
+- 受限 payment tx envelope
+- `payment_nonce_key`
+- `valid_before`
+
+落点大致会在：
+
+- `crates/transaction-pool/src/traits.rs`
+- `crates/transaction-pool/src/validate/eth.rs`
+- 自定义 transaction type / engine types
+
+### 5.4 Phase 4: 受限 fast path，而不是 generic fast path
+
+这是从 Sui 借鉴最多的一步，但要非常克制。
+
+#### 关键判断
+
+`reth` 上的 fast path 不应针对任意 EVM payment tx，而应针对一个受限的、协议内建的 payment path。
+
+#### 推荐模型
+
+定义一个 `FastPaymentTx` 或 `PaymentIntentTx`，它只能：
+
+- 调用 protocol-enforced payment precompile / system contract
+- 进行固定格式的转账或批量转账
+- 不允许 arbitrary external call
+- 不允许 CREATE / DELEGATECALL
+- 读写集可由交易内容静态确定
+
+#### 这样才能获得什么
+
+只有在这种条件下，才有机会实现：
+
+- 冲突检测按 `(asset, sender, receiver, nonce_key)` 或 payment shard 做局部化
+- 非冲突 payment 并行执行
+- 快速出具 committee certificate
+- 后续再锚定进 block
+
+#### 不建议做的事
+
+- 不要让任意 ERC-20 `transfer` 直接走 fast path
+- 不要让 fast path 依赖运行时动态分析任意 EVM bytecode 的读写集
+- 不要在没有协议内建 payment contract 的前提下声称能做 Sui-style fast path
+
+### 5.5 Finality: 用 BFT finality，而不是只靠更快出块
+
+如果目标是“payment finality”，真正需要的是 `deterministic finality`，而不是单纯把 block time 从 12s 改成 1s。
+
+#### 两种实现方式
+
+##### 方案 A：先做外部 BFT 共识 sidecar
+
+这是我更推荐的起步方式。
+
+思路：
+
+- 保留当前 `reth` 作为 EL
+- 新增一个 payment-first BFT consensus sidecar
+- sidecar 通过 Engine API 驱动 `newPayload` / `forkchoiceUpdated`
+- sidecar 在 500ms~1s 节奏内推进 head/safe/finalized
+
+优点：
+
+- 对当前 repo 侵入更小
+- 可以最大化复用现有 engine tree / execution / storage
+- 能最快验证 deterministic finality 的收益
+
+缺点：
+
+- 仍然是“外部 CL 驱动 EL”的架构
+- 对 payment lane / fast path 的协议扩展要额外约定 payload types
+
+##### 方案 B：把 BFT 共识直接内嵌到当前 node launch 路径
+
+需要改造：
+
+- `crates/node/builder/src/launch/engine.rs`
+- `crates/engine/tree/src/engine.rs`
+- `crates/node/builder/src/components/consensus.rs`
+
+做法是让当前节点直接具备 proposer / vote / finalize 流程，而不再把 finality 完全当成外部输入。
+
+优点：
+
+- 延迟更低
+- 架构更完整
+
+缺点：
+
+- 改动面最大
+- 调试、网络协议、密钥管理、投票聚合复杂度都更高
+
+#### 我的建议
+
+先做 `方案 A`，后续再决定是否收敛成 in-process BFT。
+
+### 5.6 Preconfirmation：在 deterministic finality 前给 payment 一个更快反馈
+
+如果想比 block finality 更早给 payment workflow 一个“可继续执行”的信号，可以增加 payment preconfirmation。
+
+建议语义：
+
+- 仅针对 `payment lane + fast-payment eligible tx`
+- 由 proposer 或 2f+1 validator committee 出具签名证明
+- 证明的是“已被接受并承诺进入下一个 payment block / lane”
+- 最终仍以 finalized block 为强结算依据
+
+这一步很适合 API/MCP/machine-payment 场景，因为很多业务只需要一个低延迟、可验证、可追责的继续信号。
+
+## 6. 在当前 repo 中的具体落点
+
+### 6.1 最小侵入版本
+
+- `crates/transaction-pool/*`
+  - 增加 payment classifier、lane metadata、payment-aware ordering
+- `crates/ethereum/payload/*`
+  - 增加 dual-budget payload builder
+- `crates/ethereum/node/src/payload.rs`
+  - 用自定义 payload builder 替换默认 builder
+- `crates/ethereum/node/src/node.rs`
+  - 注入自定义 pool builder / payload builder
+
+这一版就能先把 throughput 问题缓解掉。
+
+### 6.2 协议化版本
+
+- `crates/ethereum/engine-primitives/*`
+  - 新 payload / header 类型
+- `crates/ethereum/node/src/engine.rs`
+  - 自定义 payload validator / Engine API field validation
+- `crates/consensus/*` + `crates/ethereum/consensus/*`
+  - lane validity rule
+- `examples/custom-engine-types/*`
+  - 可作为原型模板
+
+这一版能把 payment lane 从“本地策略”升级成“协议保证”。
+
+### 6.3 finality 版本
+
+- `crates/engine/primitives/src/forkchoice.rs`
+  - 适配更快、更确定的 finalized/safe 推进
+- `crates/engine/tree/src/engine.rs`
+  - 对接新的 consensus event source
+- `crates/node/builder/src/launch/engine.rs`
+  - 接入 BFT sidecar 或 in-process consensus
+
+### 6.4 RPC / 可观测性
+
+建议新增 payment 专用指标与 RPC：
+
+- payment/general tx backlog
+- payment inclusion p50/p95/p99
+- payment finalized latency
+- payment lane utilization
+- hot-account parallelism
+- preconfirmation issuance / failure
+
+可以通过：
+
+- `crates/rpc/rpc/src/reth.rs`
+- 或参照 `examples/node-custom-rpc`
+
+暴露诸如：
+
+- `reth_getPaymentLaneStats`
+- `reth_getPaymentTxStatus`
+- `reth_subscribePaymentFinality`
+
+## 7. 推荐的实施顺序
+
+### Step 1
+
+先做 `soft payment lane`：
+
+- payment classifier
+- payment-aware ordering
+- dual-budget payload builder
+- metrics / benchmark
+
+### Step 2
+
+再做 `parallel nonce / expiring nonce`：
+
+- 先解决 hot sender 串行化
+- 否则 payment lane 的收益会被大账户 nonce 阻塞抵消掉
+
+### Step 3
+
+再做 `consensus-enforced lane`：
+
+- 新 header fields
+- 新 payload / validator
+- lane validity rule
+
+### Step 4
+
+最后做 `BFT deterministic finality`：
+
+- 优先外部 sidecar
+- 再考虑 in-process
+
+### Step 5
+
+在 payment path 足够收敛后，再上 `constrained fast path`。
+
+## 8. 我推荐的最终目标架构
+
+如果目标是做一条真正的 payment-first chain，我建议最终架构如下：
+
+1. `BFT consensus`
+   500ms~1s 级别 deterministic finality
+2. `consensus-enforced payment lane`
+   payment/general 双预算
+3. `payment-specific tx semantics`
+   parallel nonce / expiring nonce / sponsorship
+4. `constrained fast path`
+   仅针对 protocol-enforced payment tx
+5. `preconfirmation`
+   给同步支付流程更快反馈
+
+## 9. 明确不建议的路线
+
+### 9.1 只改 txpool，不改 block validity，却宣称有 payment lane 保证
+
+这只能算 local policy，不能算 protocol guarantee。
+
+### 9.2 在任意 ERC-20 / 任意合约调用上强行做 Sui fast path
+
+这会在 EVM 的共享状态模型上引入非常高的正确性风险。
+
+### 9.3 只靠更快出块解决 finality
+
+更快出块只是更快“看到块”，不是更快“得到不可逆结算”。
+
+## 10. 成功标准
+
+建议用下面几类指标衡量：
+
+- 混合负载下 payment TPS 是否明显高于基线
+- DeFi/复杂合约拥堵时 payment p99 inclusion latency 是否仍然稳定
+- 单 hot sender 是否能显著提高并发发送能力
+- finalized payment latency 是否降低到 1s 量级
+- finalized 后 reorg 是否为 0
+
+## 11. 最后结论
+
+对当前 repo，我的建议不是“先做 fast path”，而是：
+
+1. **先做 payment lane**
+2. **再做 parallel nonce / payment tx semantics**
+3. **然后把 lane 协议化**
+4. **最后再上 BFT finality 和受限 fast path**
+
+原因很简单：
+
+- payment lane 是当前 `reth` 架构里最自然、最稳妥、收益也最大的改造点
+- deterministic finality 必须通过新的 consensus layer 获得
+- Sui fast path 可以借鉴，但只能在一个更受限、协议内建的 payment execution path 上成立
+
+换句话说，`Tempo-style lane + BFT finality` 应该是主线，`Sui-style fast path` 应该是 payment path 足够收敛之后的增强项，而不是起点。
