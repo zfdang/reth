@@ -438,7 +438,7 @@ mod tests {
         let err = NonceError::NonceTooLow { key: 0, expected: 5, got: 3 };
         let msg = err.to_string();
         assert!(msg.contains("too low"));
-        assert!(msg.contains("5"));
-        assert!(msg.contains("3"));
+        assert!(msg.contains('5'));
+        assert!(msg.contains('3'));
     }
 }
