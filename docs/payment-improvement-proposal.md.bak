@@ -172,7 +172,7 @@ Suggested packing strategy:
 1. place system transactions first, if any
 2. cap general transactions with `general_gas_limit_soft`
 3. before reaching the total block gas limit, continue prioritizing payment transactions
-4. when payment backlog is low, reclaim unused reserved capacity for general transactions
+4. keep the general lane hard-capped; unused payment capacity is not reassigned to general transactions in the current implementation
 
 The result is:
 

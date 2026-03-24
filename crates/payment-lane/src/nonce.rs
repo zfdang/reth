@@ -166,7 +166,11 @@ impl SenderNonceState {
     ///
     /// Returns `Ok(())` if the nonce is valid and was applied, or an error describing
     /// why it's invalid.
-    pub fn validate_and_advance(&mut self, nonce_key: &NonceKey) -> Result<(), NonceError> {
+    pub fn validate_and_advance(
+        &mut self,
+        sender: Address,
+        nonce_key: &NonceKey,
+    ) -> Result<(), NonceError> {
         let current = self.get_nonce(nonce_key.key);
 
         if nonce_key.value < current {
@@ -188,7 +192,7 @@ impl SenderNonceState {
         // Check if adding a new key would exceed the limit
         if !self.nonces.contains_key(&nonce_key.key) && self.nonces.len() >= self.max_keys as usize
         {
-            return Err(NonceError::TooManyNonceKeys { max: self.max_keys, sender: Address::ZERO });
+            return Err(NonceError::TooManyNonceKeys { max: self.max_keys, sender });
         }
 
         self.nonces.insert(nonce_key.key, nonce_key.value + 1);
@@ -253,6 +257,7 @@ pub enum NonceError {
 /// Validates payment transaction metadata (nonce + validity window).
 pub fn validate_payment_meta(
     meta: &PaymentTxMeta,
+    sender: Address,
     sender_state: &mut SenderNonceState,
     block_timestamp: u64,
 ) -> Result<(), NonceError> {
@@ -271,26 +276,28 @@ pub fn validate_payment_meta(
     }
 
     // Validate and advance nonce
-    sender_state.validate_and_advance(&meta.nonce_key)
+    sender_state.validate_and_advance(sender, &meta.nonce_key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const TEST_SENDER: Address = Address::repeat_byte(0x11);
+
     #[test]
     fn test_protocol_nonce_sequential() {
         let mut state = SenderNonceState::new(0, 256);
 
         let meta0 = PaymentTxMeta::standard(0);
-        assert!(validate_payment_meta(&meta0, &mut state, 100).is_ok());
+        assert!(validate_payment_meta(&meta0, TEST_SENDER, &mut state, 100).is_ok());
 
         let meta1 = PaymentTxMeta::standard(1);
-        assert!(validate_payment_meta(&meta1, &mut state, 100).is_ok());
+        assert!(validate_payment_meta(&meta1, TEST_SENDER, &mut state, 100).is_ok());
 
         // Replay should fail
         let replay = PaymentTxMeta::standard(0);
-        assert!(validate_payment_meta(&replay, &mut state, 100).is_err());
+        assert!(validate_payment_meta(&replay, TEST_SENDER, &mut state, 100).is_err());
     }
 
     #[test]
@@ -302,17 +309,17 @@ mod tests {
         let tx_b = PaymentTxMeta::parallel(2, 0);
         let tx_c = PaymentTxMeta::parallel(3, 0);
 
-        assert!(validate_payment_meta(&tx_a, &mut state, 100).is_ok());
-        assert!(validate_payment_meta(&tx_b, &mut state, 100).is_ok());
-        assert!(validate_payment_meta(&tx_c, &mut state, 100).is_ok());
+        assert!(validate_payment_meta(&tx_a, TEST_SENDER, &mut state, 100).is_ok());
+        assert!(validate_payment_meta(&tx_b, TEST_SENDER, &mut state, 100).is_ok());
+        assert!(validate_payment_meta(&tx_c, TEST_SENDER, &mut state, 100).is_ok());
 
         // Advance key 1 to nonce 1
         let tx_a1 = PaymentTxMeta::parallel(1, 1);
-        assert!(validate_payment_meta(&tx_a1, &mut state, 100).is_ok());
+        assert!(validate_payment_meta(&tx_a1, TEST_SENDER, &mut state, 100).is_ok());
 
         // Key 2 is still at nonce 1 (not 0 anymore), should fail with nonce 0
         let tx_b0 = PaymentTxMeta::parallel(2, 0);
-        assert!(validate_payment_meta(&tx_b0, &mut state, 100).is_err());
+        assert!(validate_payment_meta(&tx_b0, TEST_SENDER, &mut state, 100).is_err());
     }
 
     #[test]
@@ -323,14 +330,14 @@ mod tests {
         let meta = PaymentTxMeta::expiring(1, 0, 200);
 
         // Valid at timestamp 100
-        assert!(validate_payment_meta(&meta, &mut state, 100).is_ok());
+        assert!(validate_payment_meta(&meta, TEST_SENDER, &mut state, 100).is_ok());
 
         // Re-create state for clean test
         let mut state2 = SenderNonceState::new(0, 256);
 
         // Expired at timestamp 200
         let meta2 = PaymentTxMeta::expiring(1, 0, 200);
-        assert!(validate_payment_meta(&meta2, &mut state2, 200).is_err());
+        assert!(validate_payment_meta(&meta2, TEST_SENDER, &mut state2, 200).is_err());
     }
 
     #[test]
@@ -345,10 +352,10 @@ mod tests {
         };
 
         // Too early
-        assert!(validate_payment_meta(&meta, &mut state, 50).is_err());
+        assert!(validate_payment_meta(&meta, TEST_SENDER, &mut state, 50).is_err());
 
         // Valid
-        assert!(validate_payment_meta(&meta, &mut state, 150).is_ok());
+        assert!(validate_payment_meta(&meta, TEST_SENDER, &mut state, 150).is_ok());
     }
 
     #[test]
@@ -357,14 +364,14 @@ mod tests {
 
         // Key 0 (protocol) already exists, so we can add 2 more
         let tx1 = PaymentTxMeta::parallel(1, 0);
-        assert!(validate_payment_meta(&tx1, &mut state, 100).is_ok());
+        assert!(validate_payment_meta(&tx1, TEST_SENDER, &mut state, 100).is_ok());
 
         let tx2 = PaymentTxMeta::parallel(2, 0);
-        assert!(validate_payment_meta(&tx2, &mut state, 100).is_ok());
+        assert!(validate_payment_meta(&tx2, TEST_SENDER, &mut state, 100).is_ok());
 
         // This should fail — max 3 keys and we already have keys 0, 1, 2
         let tx3 = PaymentTxMeta::parallel(3, 0);
-        assert!(validate_payment_meta(&tx3, &mut state, 100).is_err());
+        assert!(validate_payment_meta(&tx3, TEST_SENDER, &mut state, 100).is_err());
     }
 
     #[test]
@@ -373,7 +380,7 @@ mod tests {
 
         // Skip nonce 0, try nonce 1 — should fail
         let meta = PaymentTxMeta::standard(1);
-        assert!(validate_payment_meta(&meta, &mut state, 100).is_err());
+        assert!(validate_payment_meta(&meta, TEST_SENDER, &mut state, 100).is_err());
     }
 
     #[test]
@@ -412,7 +419,7 @@ mod tests {
         assert_eq!(state.active_keys(), 1); // key 0 (protocol)
 
         let tx = PaymentTxMeta::parallel(1, 0);
-        assert!(validate_payment_meta(&tx, &mut state, 100).is_ok());
+        assert!(validate_payment_meta(&tx, TEST_SENDER, &mut state, 100).is_ok());
         assert_eq!(state.active_keys(), 2);
     }
 
@@ -440,5 +447,21 @@ mod tests {
         assert!(msg.contains("too low"));
         assert!(msg.contains('5'));
         assert!(msg.contains('3'));
+    }
+
+    #[test]
+    fn test_too_many_nonce_keys_reports_sender() {
+        let mut state = SenderNonceState::new(0, 1);
+        let meta = PaymentTxMeta::parallel(1, 0);
+
+        let err = validate_payment_meta(&meta, TEST_SENDER, &mut state, 100).unwrap_err();
+
+        match err {
+            NonceError::TooManyNonceKeys { max, sender } => {
+                assert_eq!(max, 1);
+                assert_eq!(sender, TEST_SENDER);
+            }
+            other => panic!("expected TooManyNonceKeys, got {other:?}"),
+        }
     }
 }

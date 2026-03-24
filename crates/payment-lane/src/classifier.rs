@@ -75,8 +75,8 @@ impl PaymentClassifier {
     }
 
     fn is_payment_target(&self, to: &Address) -> bool {
-        self.config.payment_allowlist.contains(to) ||
-            self.config.payment_address_prefixes.iter().any(|prefix| prefix.matches(to))
+        self.config.payment_allowlist.contains(to)
+            || self.config.payment_address_prefixes.iter().any(|prefix| prefix.matches(to))
     }
 
     fn is_supported_payment_call(&self, input: &[u8]) -> bool {

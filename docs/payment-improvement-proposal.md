@@ -133,8 +133,8 @@ pub struct PaymentLanePayloadBuilder<Pool, Client, EvmConfig> { ... }
 
 1. Classify each candidate transaction as `Payment` or `General`
 2. Limit general transactions with `general_gas_limit` (default: `block_gas_limit * 0.7`)
-3. Allow payment transactions to consume the reserved budget (default: 30 percent of block gas)
-4. When the reserved budget is underused, allow general transactions to reclaim the spare capacity
+3. Allow payment transactions to use any remaining gas up to `block_gas_limit`
+4. Keep general transactions on a strict `general_gas_limit`; unused payment capacity is not reassigned to the general lane in the current implementation
 
 **Configuration** (`PaymentLaneConfig`):
 
