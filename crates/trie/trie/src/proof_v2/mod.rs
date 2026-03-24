@@ -238,13 +238,13 @@ where
             // point the target for 0xabc2 will not match the branch due to its prefix, but any of
             // the other targets would, so we need to check those as well.
             if lower.key_nibbles.starts_with(path) {
-                return !check_min_len
-                    || (path.len() >= lower.min_len as usize
-                        || targets
+                return !check_min_len ||
+                    (path.len() >= lower.min_len as usize ||
+                        targets
                             .skip_iter()
                             .take_while(|target| target.key_nibbles.starts_with(path))
-                            .any(|target| path.len() >= target.min_len as usize)
-                        || targets
+                            .any(|target| path.len() >= target.min_len as usize) ||
+                        targets
                             .rev_iter()
                             .take_while(|target| target.key_nibbles.starts_with(path))
                             .any(|target| path.len() >= target.min_len as usize));
@@ -718,8 +718,8 @@ where
         }
 
         // Loop over all keys in the range, calling `push_leaf` on each.
-        while let Some((key, _)) = hashed_cursor_current.as_ref()
-            && upper_bound.is_none_or(|upper_bound| key < &upper_bound)
+        while let Some((key, _)) = hashed_cursor_current.as_ref() &&
+            upper_bound.is_none_or(|upper_bound| key < &upper_bound)
         {
             let (key, val) =
                 core::mem::take(hashed_cursor_current).expect("while-let checks for Some");
@@ -1114,8 +1114,8 @@ where
             // This can happen when `calculate_key_range` finds no keys for a child's range,
             // leaving the child's bit unset in `state_mask`. Without this, re-entering this
             // function would select the same child again.
-            if uncalculated_lower_bound_ref.starts_with(&self.branch_path)
-                && uncalculated_lower_bound_ref.len() > self.branch_path.len()
+            if uncalculated_lower_bound_ref.starts_with(&self.branch_path) &&
+                uncalculated_lower_bound_ref.len() > self.branch_path.len()
             {
                 let lower_nibble =
                     uncalculated_lower_bound_ref.get_unchecked(self.branch_path.len());
@@ -1130,8 +1130,8 @@ where
                     ?next_child_nibbles,
                     "Unset already processed key nibbles from next_child_nibbles",
                 );
-            } else if !uncalculated_lower_bound_ref.starts_with(&self.branch_path)
-                && uncalculated_lower_bound_ref > &self.branch_path
+            } else if !uncalculated_lower_bound_ref.starts_with(&self.branch_path) &&
+                uncalculated_lower_bound_ref > &self.branch_path
             {
                 // The lower bound has moved entirely past this branch (e.g. branch is 0x6 but
                 // lower is 0x7). All remaining children have been processed.
@@ -1178,8 +1178,8 @@ where
             // any dirty leaves between that path and this child, it indicates there may be leaves
             // which would split that extension node. In that case we return the range to process
             // the leaves.
-            if uncalculated_lower_bound_ref < &child_path
-                && self.prefix_set.contains_range(uncalculated_lower_bound_ref..&child_path)
+            if uncalculated_lower_bound_ref < &child_path &&
+                self.prefix_set.contains_range(uncalculated_lower_bound_ref..&child_path)
             {
                 self.cached_branch_stack.push((cached_path, cached_branch));
                 return Ok(Some((*uncalculated_lower_bound_ref, Some(child_path))));
@@ -1194,8 +1194,8 @@ where
             //
             // If the child's path is in the prefix set then the cached hash is stale and must
             // not be used.
-            if cached_branch.hash_mask.is_bit_set(child_nibble)
-                && !self.prefix_set.contains(&child_path)
+            if cached_branch.hash_mask.is_bit_set(child_nibble) &&
+                !self.prefix_set.contains(&child_path)
             {
                 // Commit the last child. We do this here for two reasons:
                 // - `commit_last_child` will check if the last child needs to be retained. We need
@@ -1253,8 +1253,8 @@ where
             // the cached branch for this child. We push it onto the `cached_branch_stack` and loop
             // back to the top.
             if let TrieCursorState::Available(next_cached_path, next_cached_branch) =
-                &trie_cursor_state
-                && next_cached_path.starts_with(&child_path)
+                &trie_cursor_state &&
+                next_cached_path.starts_with(&child_path)
             {
                 // Push the current cached branch back on before pushing its child and then looping
                 self.cached_branch_stack.push((cached_path, cached_branch));
@@ -1371,8 +1371,8 @@ where
             //
             // This can specifically happen when there is a cached branch which shouldn't exist, or
             // if state mask bit is set on a cached branch which shouldn't be.
-            if let Some(prev_lower) = prev_uncalculated_lower_bound.as_ref()
-                && calc_lower_bound < *prev_lower
+            if let Some(prev_lower) = prev_uncalculated_lower_bound.as_ref() &&
+                calc_lower_bound < *prev_lower
             {
                 let msg = format!(
                     "next_uncached_key_range went backwards: calc_lower={calc_lower_bound:?} < \
@@ -1896,8 +1896,8 @@ mod tests {
             // Helper function to check if a node path matches at least one target
             let node_matches_target = |node_path: &Nibbles| -> bool {
                 targets_vec.iter().any(|target| {
-                    target.key_nibbles.starts_with(node_path)
-                        && node_path.len() >= target.min_len as usize
+                    target.key_nibbles.starts_with(node_path) &&
+                        node_path.len() >= target.min_len as usize
                 })
             };
 

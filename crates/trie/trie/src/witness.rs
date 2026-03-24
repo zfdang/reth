@@ -217,8 +217,8 @@ where
         let mut account_removals: B256Map<LeafUpdate> = B256Map::default();
         let mut account_upserts: B256Map<LeafUpdate> = B256Map::default();
         for &hashed_address in state.accounts.keys().chain(state.storages.keys()) {
-            if account_removals.contains_key(&hashed_address)
-                || account_upserts.contains_key(&hashed_address)
+            if account_removals.contains_key(&hashed_address) ||
+                account_upserts.contains_key(&hashed_address)
             {
                 continue;
             }
@@ -295,8 +295,8 @@ where
         let bytes = Bytes::from(encoded.clone());
         self.witness.entry(keccak256(&bytes)).or_insert(bytes);
 
-        if let TrieNodeV2::Branch(branch) = node
-            && !branch.key.is_empty()
+        if let TrieNodeV2::Branch(branch) = node &&
+            !branch.key.is_empty()
         {
             encoded.clear();
             BranchNodeRef::new(&branch.stack, branch.state_mask).encode(encoded);

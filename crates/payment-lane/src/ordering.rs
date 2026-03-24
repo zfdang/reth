@@ -49,7 +49,8 @@ const fn lane_rank(lane: TxLane) -> u8 {
 ///
 /// Payment transactions receive a priority boost, ensuring they are included
 /// preferentially during block building. Within the same lane, transactions
-/// are ordered by effective tip per gas (same as [`CoinbaseTipOrdering`]).
+/// are ordered by effective tip per gas (same as
+/// [`reth_transaction_pool::CoinbaseTipOrdering`]).
 pub struct PaymentAwareOrdering<T> {
     /// The classifier used to determine transaction lanes.
     classifier: PaymentClassifier,

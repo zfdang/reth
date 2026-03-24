@@ -23,7 +23,7 @@ reth-payload-primitives.workspace = true
 reth-consensus.workspace = true
 reth-consensus-common.workspace = true
 reth-evm.workspace = true
-reth-evm-ethereum = { workspace = true, features = ["std"] }
+reth-evm-ethereum.workspace = true
 reth-errors.workspace = true
 reth-chainspec.workspace = true
 reth-storage-api.workspace = true
@@ -47,13 +47,25 @@ serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
-tokio = { workspace = true, features = ["rt", "macros"] }
 
 [features]
 default = ["std"]
 std = [
+    "reth-chainspec/std",
     "reth-primitives-traits/std",
     "reth-consensus/std",
+    "reth-consensus-common/std",
+    "reth-ethereum-primitives/std",
+    "reth-evm/std",
+    "reth-evm-ethereum/std",
+    "reth-execution-types/std",
+    "reth-revm/std",
+    "reth-storage-api/std",
     "alloy-primitives/std",
     "alloy-consensus/std",
+    "alloy-rlp/std",
+    "revm/std",
+    "serde/std",
+    "thiserror/std",
+    "tracing/std",
 ]

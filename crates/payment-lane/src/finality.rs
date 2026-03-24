@@ -142,8 +142,8 @@ impl FinalityCertificate {
                 return false;
             }
 
-            if vote.validator_index >= config.validator_count
-                || !voters.insert(vote.validator_index)
+            if vote.validator_index >= config.validator_count ||
+                !voters.insert(vote.validator_index)
             {
                 return false;
             }

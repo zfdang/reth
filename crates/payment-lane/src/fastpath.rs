@@ -108,8 +108,8 @@ impl BatchPaymentIntent {
 
     /// Returns true if the batch is valid: non-empty, non-self-transfers, non-zero amounts.
     pub fn is_valid(&self) -> bool {
-        !self.transfers.is_empty()
-            && self.transfers.iter().all(|t| t.to != self.from && t.amount > U256::ZERO)
+        !self.transfers.is_empty() &&
+            self.transfers.iter().all(|t| t.to != self.from && t.amount > U256::ZERO)
     }
 }
 
