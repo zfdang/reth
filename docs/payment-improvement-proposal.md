@@ -1,6 +1,15 @@
 # Payment Throughput and Finality Improvement — Design Document
 
-This document covers the problem analysis, reference study, and overall design for improving payment throughput and finality in `reth`. For the corresponding implementation summary, see [payment-improvement-proposal.v1.md](payment-improvement-proposal.v1.md).
+This document covers the problem analysis, reference study, and overall design for improving payment throughput and finality in `reth`. For the corresponding crate-level implementation summary, see [payment-improvement-implementation-summary.md](payment-improvement-implementation-summary.md).
+
+Scope: this document explains why the payment lane is needed, what constraints shape the design, what each phase is intended to deliver, and where the design should eventually integrate into the repo. It intentionally does not catalog crate APIs, test inventory, or current implementation status.
+
+Read this document when you need:
+
+- The bottleneck analysis behind the proposal
+- The Sui fast-path and Tempo reference comparison
+- The phase-by-phase design decisions and non-recommended routes
+- The intended integration points in the wider `reth` repo
 
 ---
 
@@ -113,6 +122,27 @@ Enhancement track: Phase 3 (2D Nonce)  -> Phase 4 (Fast Path)
 - Restrict fast path to a constrained payment path, not a generic EVM fast path
 - Start BFT finality as an external sidecar first, then consider in-process integration later
 
+### 4.1 Layered View of the Proposal
+
+The proposal spans several blockchain layers. Looking at it through that lens helps clarify which changes are merely local policy, which alter transaction semantics, and which become consensus-critical.
+
+| Layer | What belongs here | Changes in this proposal | Main phases |
+|-------|-------------------|--------------------------|-------------|
+| **Network level** | Transaction propagation, sidecar vote transport, preconfirmation dissemination | No mandatory changes in the early phases; Phase 5 may introduce BFT vote transport and optional preconfirmation distribution | 5 |
+| **Transaction level** | Transaction format, nonce semantics, validity windows, payment intent structure | Payment classification rules, 2D nonce keys, `valid_after` / `valid_before`, constrained `PaymentIntent` / `BatchPaymentIntent` semantics | 1, 3, 4 |
+| **Block construction level** | Txpool ordering, proposer selection policy, payload packing | Payment-aware ordering, dual-budget payload builder, reserved payment capacity | 1 |
+| **Execution level** | State-transition accounting, conflict detection, execution scheduling | Post-execution lane gas accounting, statically derived read/write sets, non-conflicting payment batch partitioning | 2, 4 |
+| **Consensus level** | Block validity rules, fork choice inputs, deterministic finality rules | Lane gas rule in block validation, BFT voting thresholds, finality certificates, preconfirmations as an auxiliary signal | 2, 5 |
+| **Node / integration level** | Engine API wiring, node launch composition, RPC, metrics, operational rollout | Sidecar integration, repo touchpoints, payment-specific observability and APIs | 1, 2, 5 |
+
+### 4.2 How to Read the Phases by Layer
+
+- If a change only affects local txpool ordering or payload packing, it is a **block construction** change, not a protocol guarantee.
+- If a change introduces new nonce fields, validity windows, or constrained payment transaction types, it is a **transaction-level** change.
+- If a rule can make a block invalid on another node, it is a **consensus-level** change.
+- If a change depends on message dissemination or vote exchange between validators, it has a **network-level** component.
+- If a change only affects metrics, RPC exposure, or launch wiring, it is a **node / integration** concern rather than a new protocol rule.
+
 ---
 
 ## 5. Phase 1: Soft Payment Lane
@@ -120,6 +150,8 @@ Enhancement track: Phase 3 (2D Nonce)  -> Phase 4 (Fast Path)
 ### Goal
 
 Without changing the block/header consensus format, make the builder policy payment-aware.
+
+**Primary layers touched**: block construction, transaction classification, node integration. No consensus-level or mandatory network-level changes.
 
 ### Design
 
@@ -153,6 +185,8 @@ This conservative AND-logic approach favors false negatives over cross-client in
 
 Upgrade the payment lane from builder policy to consensus rule.
 
+**Primary layers touched**: execution and consensus. This is the phase where the payment lane stops being only proposer-local policy.
+
 ### Design
 
 Wrap the existing consensus implementation and inject lane gas validation in `validate_block_post_execution`:
@@ -182,6 +216,8 @@ The accounting uses actual gas consumed from receipts, not declared gas limits. 
 ### Goal
 
 Solve the hot-sender serialization problem.
+
+**Primary layers touched**: transaction semantics and execution-time sender-state validation.
 
 ### Design
 
@@ -216,6 +252,8 @@ Solve the hot-sender serialization problem.
 
 Enable parallel execution of non-conflicting payment operations.
 
+**Primary layers touched**: transaction semantics and execution scheduling. This phase still avoids generic network-level or consensus-level changes for arbitrary EVM calls.
+
 ### Design
 
 Borrow the conflict-detection intuition from Sui, but **only for payment operations whose read/write sets can be derived statically**.
@@ -242,6 +280,8 @@ A payment touches exactly two state slots: `(asset, sender)` and `(asset, receiv
 ### Goal
 
 Provide deterministic sub-second settlement.
+
+**Primary layers touched**: consensus, network, and node integration.
 
 ### Design
 

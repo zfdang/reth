@@ -1,6 +1,15 @@
 # Payment Lane Implementation Summary
 
-This document summarizes the `reth-payment-lane` crate — the production implementation of the payment throughput and finality improvement system. For the problem analysis, reference study, and design rationale, see [payment-improvement-proposal.md](payment-improvement-proposal.md).
+This document summarizes the current `reth-payment-lane` crate implementation. It is intentionally implementation-focused: module surfaces, key types and methods, validation status, metrics, and what remains to be wired into the rest of the repo. For the problem analysis, reference study, and design rationale, see [payment-improvement-proposal.md](payment-improvement-proposal.md).
+
+Scope: this document covers the crate as it exists today. It does not repeat the Sui/Tempo reference study or justify the phased roadmap; those remain in the design document.
+
+Read this document when you need:
+
+- The current crate structure and module boundaries
+- The implemented types, methods, and behavior summaries
+- The current test inventory and validation scope
+- The concrete boundary between shipped crate primitives and future repo integration work
 
 ---
 
@@ -10,8 +19,9 @@ This document summarizes the `reth-payment-lane` crate — the production implem
 |---|---|
 | **Crate** | `reth-payment-lane` |
 | **Location** | `crates/payment-lane/` |
-| **Tests** | 81 unit tests, all passing |
-| **Quality** | `cargo check`, `cargo fmt`, `cargo clippy` — clean |
+| **Tests** | 82 unit tests in the current tree |
+| **Validation scope** | Crate-level `cargo check`, `cargo clippy`, `cargo test`, targeted `cargo +nightly udeps`, and targeted `cargo +nightly doc` |
+| **Integration status** | Core primitives are implemented in a standalone crate; default node / Engine / tx-envelope wiring is still future work |
 
 ### Module Map
 
@@ -20,11 +30,11 @@ This document summarizes the `reth-payment-lane` crate — the production implem
 | Configuration | `config.rs` | 1–5 | 8 | Central config, gas budget computation |
 | Classifier | `classifier.rs` | 1 | 12 | Stateless tx classification (payment / general) |
 | Ordering | `ordering.rs` | 1 | 7 | Payment-aware priority for the txpool |
-| Payload builder | `payload.rs` | 1 | 7 | Dual-budget `PayloadBuilder` |
+| Payload builder | `payload.rs` | 1 | 6 | Dual-budget `PayloadBuilder` |
 | Consensus | `consensus.rs` | 2 | 10 | Post-execution lane gas enforcement |
-| 2D nonce | `nonce.rs` | 3 | 13 | Parallel nonce keys, validity windows |
+| 2D nonce | `nonce.rs` | 3 | 14 | Parallel nonce keys, validity windows |
 | Fast path | `fastpath.rs` | 4 | 9 | Conflict detection, batch partitioning |
-| BFT finality | `finality.rs` | 5 | 15 | Vote collection, finality certificates |
+| BFT finality | `finality.rs` | 5 | 16 | Vote collection, finality certificates |
 | Metrics | `metrics.rs` | 1–5 | — | 14 Prometheus counters |
 | Re-exports | `lib.rs` | — | — | Module declarations and public API surface |
 
@@ -77,7 +87,7 @@ Stateless, no chain state. Classification requires **both** conditions:
 1. `to` address matches a prefix **or** appears in the allowlist
 2. Calldata is exactly `transfer(address,uint256)` — selector `0xa9059cbb`, 68 bytes total
 
-Design choice: `transferFrom` is excluded (its allowance writes make the read/write set non-trivial).
+The supported payment selector set is intentionally limited to `transfer(address,uint256)`. `transferFrom` is classified as `General`.
 
 ```rust
 pub fn classify(&self, to: Option<&Address>, input: &[u8]) -> TxLane
@@ -329,8 +339,8 @@ A proposer-signed acknowledgment before full finality — useful for low-latency
 | `payment_tx_included` | Payment transactions included in built blocks |
 | `general_tx_included` | General transactions included in built blocks |
 | `general_tx_skipped_lane_full` | General transactions skipped due to budget exhaustion |
-| `payment_gas_used_reserved` | Payment gas consumed from reserved budget |
-| `payment_gas_used_overflow` | Payment gas consumed from overflow/shared capacity |
+| `payment_gas_used_reserved` | Payment transactions that consumed reserved budget |
+| `payment_gas_used_overflow` | Payment transactions that consumed overflow/shared capacity |
 | `blocks_built` | Total blocks built with payment lane policy |
 | `consensus_lane_valid` | Blocks passing consensus lane validation |
 | `consensus_lane_invalid` | Blocks failing consensus lane validation |
@@ -362,6 +372,8 @@ External:
 ---
 
 ## 12. What Is Implemented vs. Future Work
+
+In this table, **Done** means "implemented inside the standalone crate." It does **not** mean "wired into the default `reth` node path" unless the next-step column says so.
 
 | Area | Status | Next Step |
 |------|--------|-----------|
